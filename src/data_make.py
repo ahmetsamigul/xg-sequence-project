@@ -3,44 +3,43 @@ import os
 import pandas as pd
 from statsbombpy import sb
 from tqdm import tqdm
+from utils_sb import sb_to_name
 
 OUT_DIR = "data"
 OUT_CSV = os.path.join(OUT_DIR, "shots.csv")
 
 def pick_competition():
-    """
-    Neden var?
-    - StatsBomb open data içinde bir sürü lig/sezon var.
-    - Biz önce kullanıcıya görünen bir liste verip bir tane seçiyoruz.
-    """
     comps = sb.competitions()
-    # En çok kullanılan birkaç competition'ı filtreleyip göstermek istersen burada filtre koyabilirsin.
     return comps
 
 def load_shots_from_match(match_id: int) -> pd.DataFrame:
-    """
-    Neden bu fonksiyon?
-    - Her match için events çekiyoruz.
-    - Sadece Shot eventlerini ayıklayıp standardize ediyoruz.
-    """
     events = sb.events(match_id=match_id)
 
-    # Shot olaylarını seç
-    shots = events[events["type"] == "Shot"].copy()
+    # type -> name
+    events["type_name"] = events["type"].apply(sb_to_name)
+
+    # sadece Shot
+    shots = events[events["type_name"] == "Shot"].copy()
     if shots.empty:
         return shots
 
-    # Label: goal mı?
-    # shot_outcome name == "Goal" ise 1, değilse 0
-    shots["is_goal"] = (shots["shot_outcome"] == "Goal").astype(int)
+    # outcome -> name, label
+    if "shot_outcome" in shots.columns:
+        shots["shot_outcome_name"] = shots["shot_outcome"].apply(sb_to_name)
+        shots["is_goal"] = (shots["shot_outcome_name"] == "Goal").astype(int)
+    else:
+        shots["is_goal"] = 0
 
-    # Konum (x,y) çıkar
-    # StatsBomb location genelde [x, y] formatında
+    # location -> x,y
     loc = shots["location"].apply(lambda v: v if isinstance(v, list) and len(v) == 2 else [None, None])
     shots["x"] = loc.apply(lambda t: t[0])
     shots["y"] = loc.apply(lambda t: t[1])
 
-    # Temel kolonları seç (başlangıç için yeterli)
+    # kategorikler -> name
+    for c in ["shot_body_part", "shot_type", "team", "player"]:
+        if c in shots.columns:
+            shots[c] = shots[c].apply(sb_to_name)
+
     keep = [
         "match_id",
         "id",
@@ -59,17 +58,11 @@ def load_shots_from_match(match_id: int) -> pd.DataFrame:
         "is_goal",
     ]
 
-    # Bazı kolonlar her maçta olmayabilir; var olanları al
     keep_existing = [c for c in keep if c in shots.columns]
     shots = shots[keep_existing].copy()
-
     return shots
 
 def build_dataset(competition_id: int, season_id: int, max_matches: int | None = None) -> pd.DataFrame:
-    """
-    Neden match-bazlı çekiyoruz?
-    - Sonradan train/val/test split'i match bazlı yapmak için match_id'yi tutacağız.
-    """
     matches = sb.matches(competition_id=competition_id, season_id=season_id)
     match_ids = matches["match_id"].astype(int).tolist()
 
@@ -88,24 +81,19 @@ def build_dataset(competition_id: int, season_id: int, max_matches: int | None =
     if not all_shots:
         return pd.DataFrame()
 
-    shots = pd.concat(all_shots, ignore_index=True)
-    return shots
+    return pd.concat(all_shots, ignore_index=True)
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
     comps = pick_competition()
-    # Kullanıcıya birkaç satır gösterelim
     print("Available competitions (showing first 15 rows):")
     print(comps[["competition_id", "season_id", "competition_name", "season_name"]].head(15))
 
-    # Burayı şimdilik sabit seçelim: istersen sonra input ile seçtiririz
-    # ÖRNEK: La Liga 2020/21 vs değişebilir. Çıktıdan bakıp güncelle.
     competition_id = int(input("competition_id gir: ").strip())
     season_id = int(input("season_id gir: ").strip())
 
     shots = build_dataset(competition_id, season_id, max_matches=None)
-
     if shots.empty:
         print("No shots found. Try different competition/season.")
         return

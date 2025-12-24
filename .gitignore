@@ -1,6 +1,16 @@
-.DS_Store
-__pycache__/
-.venv/
-checkpoints/
 .history/
+
+# Python
+__pycache__/
+*.pyc
+
+# venv
+.venv/
+
+# Data & outputs
 data/
+checkpoints/
+
+# OS
+.DS_Store
+results/

@@ -1,6 +1,8 @@
 # src/train_sequence.py
 import os
 import math
+import json
+import random
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass
@@ -12,41 +14,85 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, log_loss
 
-from features import compute_distance_angle, add_simple_flags
+from features import compute_distance_angle, add_simple_flags, maybe_standardize_coords
 
 EVENT_DIR = "data/events"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+# -----------------------------
+# Reproducibility
+# -----------------------------
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# -----------------------------
+# Metrics helpers
+# -----------------------------
 def brier_score(y_true, y_prob):
     y_true = np.asarray(y_true, dtype=np.float32)
     y_prob = np.asarray(y_prob, dtype=np.float32)
-    return np.mean((y_prob - y_true) ** 2)
+    return float(np.mean((y_prob - y_true) ** 2))
+
+def clip_probs(p, eps=1e-6):
+    return np.clip(np.asarray(p, dtype=np.float32), eps, 1 - eps)
+
+def ece_score(y_true, y_prob, n_bins=10):
+    y_true = np.asarray(y_true, dtype=np.float32)
+    y_prob = np.asarray(y_prob, dtype=np.float32)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lo, hi = bins[i], bins[i + 1]
+        if i < n_bins - 1:
+            m = (y_prob >= lo) & (y_prob < hi)
+        else:
+            m = (y_prob >= lo) & (y_prob <= hi)
+        if m.sum() == 0:
+            continue
+        acc = float(y_true[m].mean())
+        conf = float(y_prob[m].mean())
+        ece += (m.sum() / len(y_true)) * abs(acc - conf)
+    return float(ece)
 
 
+# -----------------------------
+# Config
+# -----------------------------
 @dataclass
 class SeqConfig:
-    seq_len: int = 10          # şuttan önceki kaç event
+    seq_len: int = 10
     batch_size: int = 64
-    epochs: int = 6
+    epochs: int = 8
     lr: float = 1e-3
+    weight_decay: float = 0.0
     hidden_size: int = 64
     rnn_type: str = "gru"      # "gru" veya "lstm"
     type_emb_dim: int = 16
     grad_clip: float = 1.0
 
 
-def build_type_vocab_from_events(match_ids, max_matches=120):
+# -----------------------------
+# Vocab
+# -----------------------------
+def build_type_vocab_from_events(match_ids, max_matches=None):
     """
-    Neden:
-    - Önceki sürümde vocab çok küçüktü, çoğu event type 0 (PAD/unknown) oluyordu.
-    - Bu da sequence bağlamını zayıflatıp AUC'yi düşürebilir.
-    - Vocab'u sadece TRAIN maçlarından çıkararak leakage'i önlüyoruz.
+    Train maçlarından event type vocab çıkarır.
+    PAD ve UNK ayrı:
+      <PAD>: 0
+      <UNK>: 1
     """
-    type_to_id = {"<PAD>": 0}
+    type_to_id = {"<PAD>": 0, "<UNK>": 1}
     seen = set()
 
-    use_ids = list(match_ids)[:max_matches]
+    use_ids = list(match_ids) if max_matches is None else list(match_ids)[:max_matches]
     for mid in use_ids:
         path = os.path.join(EVENT_DIR, f"events_{int(mid)}.csv")
         if not os.path.exists(path):
@@ -54,19 +100,22 @@ def build_type_vocab_from_events(match_ids, max_matches=120):
 
         ev = pd.read_csv(path, usecols=["type"])
         for t in ev["type"].astype(str).unique():
-            if t not in seen:
+            if t and t != "nan" and t not in seen:
                 seen.add(t)
                 type_to_id[t] = len(type_to_id)
 
     return type_to_id
 
 
+# -----------------------------
+# Dataset
+# -----------------------------
 class ShotSeqDataset(Dataset):
     """
     Her örnek:
       - type_ids: (T,)
-      - xyt: (T,3)  -> x_norm, y_norm, t_norm
-      - mask: (T,)  -> padding mask (şu an modelde doğrudan kullanılmıyor ama ileride kullanılabilir)
+      - xyt: (T,4)  -> x_norm, y_norm, t_norm, same_team_flag
+      - mask: (T,)  -> 1 valid, 0 pad
       - static: (6,) -> distance, angle, flags...
       - y: (1,) -> goal label
     """
@@ -78,7 +127,7 @@ class ShotSeqDataset(Dataset):
         df = df[df["match_id"].astype(int).isin(match_ids)].reset_index(drop=True)
         self.df = df
 
-        self._event_cache = {}  # match_id -> events df (hız için)
+        self._event_cache = {}  # match_id -> events df
 
     def __len__(self):
         return len(self.df)
@@ -90,15 +139,36 @@ class ShotSeqDataset(Dataset):
         path = os.path.join(EVENT_DIR, f"events_{match_id}.csv")
         ev = pd.read_csv(path)
 
-        # zaman saniye cinsinden
+        # güvenli kolonlar
+        for col in ["minute", "second"]:
+            if col not in ev.columns:
+                ev[col] = 0
+        for col in ["period", "index"]:
+            if col in ev.columns:
+                ev[col] = ev[col].fillna(0).astype(int)
+            else:
+                ev[col] = 0
+
+        # zaman saniye
         ev["t_sec"] = ev["minute"].fillna(0).astype(int) * 60 + ev["second"].fillna(0).astype(int)
 
-        # normalize x,y (StatsBomb: 120x80)
+        # normalize x,y
+        if "x" not in ev.columns:
+            ev["x"] = 0.0
+        if "y" not in ev.columns:
+            ev["y"] = 0.0
         ev["x_norm"] = ev["x"].fillna(0).astype(float) / 120.0
         ev["y_norm"] = ev["y"].fillna(0).astype(float) / 80.0
 
-        # type string -> id (yoksa 0'a düşer)
-        ev["type_id"] = ev["type"].astype(str).map(self.type_to_id).fillna(0).astype(int)
+        # type -> id
+        unk_id = self.type_to_id.get("<UNK>", 1)
+        if "type" not in ev.columns:
+            ev["type"] = "<UNK>"
+        ev["type_id"] = ev["type"].astype(str).map(self.type_to_id).fillna(unk_id).astype(int)
+
+        # team string
+        if "team" not in ev.columns:
+            ev["team"] = ""
 
         self._event_cache[match_id] = ev
         return ev
@@ -107,18 +177,21 @@ class ShotSeqDataset(Dataset):
         row = self.df.iloc[idx]
 
         match_id = int(row["match_id"])
-        team = str(row["team"])
+        shot_team = str(row["team"])
         shot_t = int(row["minute"]) * 60 + int(row["second"])
 
         ev = self._load_events(match_id)
 
-        # Aynı takım + şuttan önce
-        sub = ev[(ev["team"].astype(str) == team) & (ev["t_sec"] < shot_t)]
-        sub = sub.sort_values("t_sec").tail(self.cfg.seq_len)
+        # Şuttan önceki tüm eventler (hem own hem opponent)
+        sub = ev[ev["t_sec"] < shot_t].copy()
+        sub["same_team"] = (sub["team"].astype(str) == shot_team).astype(np.float32)
+
+        # Daha stabil sıralama: period, t_sec, index
+        sub = sub.sort_values(["period", "t_sec", "index"]).tail(self.cfg.seq_len)
 
         T = self.cfg.seq_len
         type_ids = np.zeros((T,), dtype=np.int64)
-        xyt = np.zeros((T, 3), dtype=np.float32)
+        xyt = np.zeros((T, 4), dtype=np.float32)   # x,y,t,same_team
         mask = np.zeros((T,), dtype=np.float32)
 
         if len(sub) > 0:
@@ -134,10 +207,11 @@ class ShotSeqDataset(Dataset):
             xyt[start:, 0] = sub["x_norm"].to_numpy(dtype=np.float32)
             xyt[start:, 1] = sub["y_norm"].to_numpy(dtype=np.float32)
             xyt[start:, 2] = t_norm
+            xyt[start:, 3] = sub["same_team"].to_numpy(dtype=np.float32)
 
             mask[start:] = 1.0
 
-        # shot static features
+        # static shot features
         static = np.array([
             float(row["distance"]),
             float(row["angle"]),
@@ -147,7 +221,7 @@ class ShotSeqDataset(Dataset):
             int(row.get("shot_aerial_won", 0)),
         ], dtype=np.float32)
 
-        # normalize (kabaca)
+        # kabaca normalize
         static[0] = static[0] / 120.0
         static[1] = static[1] / math.pi
 
@@ -162,13 +236,16 @@ class ShotSeqDataset(Dataset):
         )
 
 
+# -----------------------------
+# Model
+# -----------------------------
 class GRULSTMxG(nn.Module):
     def __init__(self, n_types: int, cfg: SeqConfig):
         super().__init__()
         self.cfg = cfg
 
-        self.type_emb = nn.Embedding(n_types, cfg.type_emb_dim)
-        step_in = cfg.type_emb_dim + 3  # emb + x,y,t
+        self.type_emb = nn.Embedding(n_types, cfg.type_emb_dim, padding_idx=0)
+        step_in = cfg.type_emb_dim + 4  # emb + x,y,t,same_team
 
         rnn_cls = nn.GRU if cfg.rnn_type.lower() == "gru" else nn.LSTM
         self.rnn = rnn_cls(
@@ -184,18 +261,32 @@ class GRULSTMxG(nn.Module):
         )
 
     def forward(self, type_ids, xyt, mask, static):
-        emb = self.type_emb(type_ids)       # (B,T,E)
-        seq = torch.cat([emb, xyt], dim=-1) # (B,T,E+3)
-        out, _ = self.rnn(seq)              # (B,T,H)
-        h_last = out[:, -1, :]              # (B,H)  (tail/padding yaklaşımıyla basit)
+        """
+        mask: (B,T) 1 valid, 0 pad
+        son valid adımın hidden'ını alıyoruz (padding'le karışmasın)
+        """
+        emb = self.type_emb(type_ids)            # (B,T,E)
+        seq = torch.cat([emb, xyt], dim=-1)      # (B,T,E+4)
+        out, _ = self.rnn(seq)                   # (B,T,H)
+
+        # last valid index per batch
+        lengths = mask.sum(dim=1).long()         # (B,)
+        idx = (lengths - 1).clamp(min=0)         # (B,)
+        b = torch.arange(out.size(0), device=out.device)
+        h_last = out[b, idx, :]                  # (B,H)
+
         z = torch.cat([h_last, static], dim=-1)
         return self.head(z)
 
 
+# -----------------------------
+# Eval loop
+# -----------------------------
 @torch.no_grad()
 def evaluate(model, loader):
     model.eval()
     ys, ps = [], []
+
     for type_ids, xyt, mask, static, y in loader:
         type_ids = type_ids.to(DEVICE)
         xyt = xyt.to(DEVICE)
@@ -203,50 +294,93 @@ def evaluate(model, loader):
         static = static.to(DEVICE)
 
         logits = model(type_ids, xyt, mask, static)
-        prob = torch.sigmoid(logits).cpu().numpy().reshape(-1)
+        prob = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
 
         ys.append(y.numpy().reshape(-1))
         ps.append(prob)
 
     y_true = np.concatenate(ys)
-    y_prob = np.concatenate(ps)
+    y_prob = clip_probs(np.concatenate(ps))
+
+    # bazı test splitlerde tek sınıf olabilir (çok küçük veri vs.)
+    # AUC böyle bir durumda hata verir, koruyalım:
+    auc = None
+    try:
+        auc = roc_auc_score(y_true, y_prob)
+    except Exception:
+        auc = float("nan")
 
     return {
-        "logloss": log_loss(y_true, y_prob),
-        "auc": roc_auc_score(y_true, y_prob),
+        "logloss": float(log_loss(y_true, y_prob)),
+        "auc": float(auc),
         "brier": brier_score(y_true, y_prob),
+        "ece": ece_score(y_true, y_prob, n_bins=10),
     }
 
 
+# -----------------------------
+# Train
+# -----------------------------
 def main():
-    # Buradan GRU/LSTM seçebilirsin:
-    # rnn_type="gru" veya "lstm"
-    cfg = SeqConfig(seq_len=10, epochs=6, rnn_type="lstm")
+    set_seed(42)
+
+    # GRU/LSTM seç
+    cfg = SeqConfig(seq_len=10, epochs=8, rnn_type="gru")
 
     shots = pd.read_csv("data/shots.csv").dropna(subset=["x", "y", "is_goal"]).copy()
 
-    # distance/angle + flags ekle
+    # Koordinat standardizasyonu gerekiyorsa enable=True yap
+    shots = maybe_standardize_coords(shots, enable=False)
+
+    # distance/angle + flags
     shots = compute_distance_angle(shots)
     shots = add_simple_flags(shots)
 
-    # match bazlı split
+    # match bazlı split: train / test
     match_ids = shots["match_id"].astype(int).unique()
     train_m, test_m = train_test_split(match_ids, test_size=0.2, random_state=42)
 
-    # vocab'u train maçlarından çıkar (leakage olmasın)
-    type_to_id = build_type_vocab_from_events(train_m, max_matches=120)
+    # train içinden val ayır
+    train_m, val_m = train_test_split(train_m, test_size=0.2, random_state=42)
+
+    os.makedirs("checkpoints", exist_ok=True)
+
+    # split kaydet (eval aynı split'i kullanabilsin)
+    split_path = "checkpoints/split.json"
+    with open(split_path, "w") as f:
+        json.dump(
+            {"train_m": list(map(int, train_m)),
+             "val_m": list(map(int, val_m)),
+             "test_m": list(map(int, test_m))},
+            f, indent=2
+        )
+    print("Saved split:", split_path)
+
+    # vocab'u train maçlarından çıkar (tüm train)
+    type_to_id = build_type_vocab_from_events(train_m, max_matches=None)
     print("Vocab size:", len(type_to_id))
 
+    # vocab kaydet (eval birebir aynı vocab'ı yükleyebilsin)
+    vocab_path = "checkpoints/type_vocab.json"
+    with open(vocab_path, "w") as f:
+        json.dump(type_to_id, f, indent=2)
+    print("Saved vocab:", vocab_path)
+
     train_ds = ShotSeqDataset(shots, train_m, type_to_id, cfg)
-    test_ds = ShotSeqDataset(shots, test_m, type_to_id, cfg)
+    val_ds   = ShotSeqDataset(shots, val_m, type_to_id, cfg)
+    test_ds  = ShotSeqDataset(shots, test_m, type_to_id, cfg)
 
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-    test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
+    val_loader   = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
+    test_loader  = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
 
     model = GRULSTMxG(n_types=len(type_to_id), cfg=cfg).to(DEVICE)
 
-    optim = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    optim = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     loss_fn = nn.BCEWithLogitsLoss()
+
+    best_val = float("inf")
+    best_path = f"checkpoints/seq_{cfg.rnn_type.lower()}_best.pt"
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
@@ -264,26 +398,35 @@ def main():
             loss = loss_fn(logits, y)
             loss.backward()
 
-            # exploding gradient'e karşı
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-
             optim.step()
             total += loss.item() * y.size(0)
 
-        train_bce = total / len(train_ds)
+        train_bce = total / max(1, len(train_ds))
+        val_metrics = evaluate(model, val_loader)
         test_metrics = evaluate(model, test_loader)
 
+        # best checkpoint by val logloss
+        if val_metrics["logloss"] < best_val:
+            best_val = val_metrics["logloss"]
+            torch.save(model.state_dict(), best_path)
+
         print(
-            f"Epoch {epoch:02d} | train_bce={train_bce:.4f} | "
-            f"test_logloss={test_metrics['logloss']:.4f} | "
-            f"test_auc={test_metrics['auc']:.4f} | "
-            f"test_brier={test_metrics['brier']:.4f}"
+            f"Epoch {epoch:02d} | "
+            f"train_bce={train_bce:.4f} | "
+            f"val_logloss={val_metrics['logloss']:.4f} val_auc={val_metrics['auc']:.4f} "
+            f"val_brier={val_metrics['brier']:.4f} val_ece={val_metrics['ece']:.4f} | "
+            f"test_logloss={test_metrics['logloss']:.4f} test_auc={test_metrics['auc']:.4f} "
+            f"test_brier={test_metrics['brier']:.4f} test_ece={test_metrics['ece']:.4f} | "
+            f"best_val={best_val:.4f}"
         )
 
-    os.makedirs("checkpoints", exist_ok=True)
-    ckpt_path = f"checkpoints/seq_{cfg.rnn_type.lower()}.pt"
-    torch.save(model.state_dict(), ckpt_path)
-    print("Saved:", ckpt_path)
+    # last checkpoint da kaydet
+    last_path = f"checkpoints/seq_{cfg.rnn_type.lower()}_last.pt"
+    torch.save(model.state_dict(), last_path)
+
+    print("Saved best:", best_path)
+    print("Saved last:", last_path)
 
 
 if __name__ == "__main__":
