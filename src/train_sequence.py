@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, log_loss
@@ -349,10 +351,13 @@ def main():
     split_path = "checkpoints/split.json"
     with open(split_path, "w") as f:
         json.dump(
-            {"train_m": list(map(int, train_m)),
-             "val_m": list(map(int, val_m)),
-             "test_m": list(map(int, test_m))},
-            f, indent=2
+            {
+                "train_m": list(map(int, train_m)),
+                "val_m": list(map(int, val_m)),
+                "test_m": list(map(int, test_m)),
+            },
+            f,
+            indent=2,
         )
     print("Saved split:", split_path)
 
@@ -367,12 +372,12 @@ def main():
     print("Saved vocab:", vocab_path)
 
     train_ds = ShotSeqDataset(shots, train_m, type_to_id, cfg)
-    val_ds   = ShotSeqDataset(shots, val_m, type_to_id, cfg)
-    test_ds  = ShotSeqDataset(shots, test_m, type_to_id, cfg)
+    val_ds = ShotSeqDataset(shots, val_m, type_to_id, cfg)
+    test_ds = ShotSeqDataset(shots, test_m, type_to_id, cfg)
 
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
-    test_loader  = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False)
 
     model = GRULSTMxG(n_types=len(type_to_id), cfg=cfg).to(DEVICE)
 
@@ -381,6 +386,18 @@ def main():
 
     best_val = float("inf")
     best_path = f"checkpoints/seq_{cfg.rnn_type.lower()}_best.pt"
+
+    # -----------------------------
+    # History (learning curves)
+    # -----------------------------
+    history = {
+        "epoch": [],
+        "train_bce": [],
+        "val_logloss": [],
+        "val_auc": [],
+        "test_logloss": [],
+        "test_auc": [],
+    }
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
@@ -421,12 +438,53 @@ def main():
             f"best_val={best_val:.4f}"
         )
 
+        # history update
+        history["epoch"].append(epoch)
+        history["train_bce"].append(train_bce)
+        history["val_logloss"].append(val_metrics["logloss"])
+        history["val_auc"].append(val_metrics["auc"])
+        history["test_logloss"].append(test_metrics["logloss"])
+        history["test_auc"].append(test_metrics["auc"])
+
+    # -----------------------------
+    # Plot learning curves (TRAIN BITTİKTEN SONRA)
+    # -----------------------------
+    os.makedirs("results", exist_ok=True)
+
+    # Loss curves
+    plt.figure()
+    plt.plot(history["epoch"], history["train_bce"], marker="o")
+    plt.plot(history["epoch"], history["val_logloss"], marker="o")
+    plt.plot(history["epoch"], history["test_logloss"], marker="o")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"Learning Curves (Loss) - {cfg.rnn_type.upper()}")
+    plt.legend(["train_bce", "val_logloss", "test_logloss"])
+    plt.tight_layout()
+    out1 = f"results/learning_curve_loss_{cfg.rnn_type.lower()}.png"
+    plt.savefig(out1, dpi=200)
+    print("Saved:", out1)
+
+    # AUC curves
+    plt.figure()
+    plt.plot(history["epoch"], history["val_auc"], marker="o")
+    plt.plot(history["epoch"], history["test_auc"], marker="o")
+    plt.xlabel("Epoch")
+    plt.ylabel("AUC")
+    plt.title(f"Learning Curves (AUC) - {cfg.rnn_type.upper()}")
+    plt.legend(["val_auc", "test_auc"])
+    plt.tight_layout()
+    out2 = f"results/learning_curve_auc_{cfg.rnn_type.lower()}.png"
+    plt.savefig(out2, dpi=200)
+    print("Saved:", out2)
+
     # last checkpoint da kaydet
     last_path = f"checkpoints/seq_{cfg.rnn_type.lower()}_last.pt"
     torch.save(model.state_dict(), last_path)
 
     print("Saved best:", best_path)
     print("Saved last:", last_path)
+
 
 
 if __name__ == "__main__":
