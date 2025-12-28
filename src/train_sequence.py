@@ -327,7 +327,7 @@ def main():
     set_seed(42)
 
     # GRU/LSTM seç
-    cfg = SeqConfig(seq_len=10, epochs=8, rnn_type="gru")
+    cfg = SeqConfig(seq_len=10, epochs=8, rnn_type="lstm")
 
     shots = pd.read_csv("data/shots.csv").dropna(subset=["x", "y", "is_goal"]).copy()
 

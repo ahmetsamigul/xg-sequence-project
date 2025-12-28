@@ -8,8 +8,7 @@ __pycache__/
 .venv/
 
 # Data & outputs
-data/
-checkpoints/
+
 
 # OS
 .DS_Store
